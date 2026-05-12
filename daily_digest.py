@@ -61,8 +61,12 @@ def granola_request(path):
 
 
 def fetch_yesterday_notes():
-    """Fetch all meeting notes created since yesterday."""
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Fetch all meeting notes from yesterday (full day, Central Time)."""
+    from zoneinfo import ZoneInfo
+    ct = ZoneInfo("America/Chicago")
+    today_start = datetime.now(ct).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = (today_start - timedelta(days=1)).astimezone(timezone.utc)
+    yesterday = yesterday_start.strftime("%Y-%m-%dT%H:%M:%SZ")
     notes = []
     cursor = None
 
