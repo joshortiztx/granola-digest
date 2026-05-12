@@ -2,12 +2,14 @@ name: Daily Meeting Digest
 
 on:
   schedule:
-    # Runs at 12:00 UTC = 7:00 AM Central Time
-    # Adjust as needed. GitHub Actions uses UTC.
-    - cron: '0 12 * * 1-5'  # Mon-Fri only
+    # 7:00 AM Central Time (12:00 UTC), weekdays only
+    - cron: '0 12 * * 1-5'
 
-  # Allow manual trigger for testing
   workflow_dispatch:
+
+# Required: allow the workflow to commit digest files back to the repo
+permissions:
+  contents: write
 
 jobs:
   digest:
@@ -31,3 +33,11 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: python daily_digest.py
+
+      - name: Commit digest file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add digests/
+          git diff --staged --quiet || git commit -m "Add digest for $(date -u +%Y-%m-%d)"
+          git push
