@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-Granola Daily Meeting Digest v2
+Granola Daily Meeting Digest v3
 Pulls yesterday's meeting notes from Granola, runs them through Claude Opus
 as a deal desk analyst / sales coach, and emails a formatted HTML digest.
+
+Changelog:
+  v3 — Inline CSS for enterprise email compatibility, tightened prompt
+        (100-word deal status cap, consolidated next steps, no-repeat coaching),
+        16384 max_tokens, CT timezone fix.
+  v2 — Opus upgrade, HTML output, coaching prompt, dark email template.
+  v1 — Initial build. Sonnet, markdown output.
 """
 
 import os
+import re
 import sys
 import json
 import smtplib
@@ -16,7 +24,7 @@ from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ── Configuration (all from environment variables) ──────────────────────────
+# ── Configuration ────────────────────────────────────────────────────────────
 GRANOLA_API_KEY = os.environ.get("GRANOLA_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 EMAIL_TO = os.environ.get("EMAIL_TO")
@@ -32,7 +40,6 @@ CT = ZoneInfo("America/Chicago")
 
 
 def check_config():
-    """Validate all required environment variables are set."""
     required = {
         "GRANOLA_API_KEY": GRANOLA_API_KEY,
         "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
@@ -46,8 +53,9 @@ def check_config():
         sys.exit(1)
 
 
+# ── Granola API ──────────────────────────────────────────────────────────────
+
 def granola_request(path):
-    """Make an authenticated GET request to the Granola API."""
     url = f"{GRANOLA_BASE}{path}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {GRANOLA_API_KEY}",
@@ -63,7 +71,6 @@ def granola_request(path):
 
 
 def fetch_yesterday_notes():
-    """Fetch all meeting notes from yesterday (full day, Central Time)."""
     today_start = datetime.now(CT).replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = (today_start - timedelta(days=1)).astimezone(timezone.utc)
     yesterday = yesterday_start.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -74,67 +81,112 @@ def fetch_yesterday_notes():
         path = f"/notes?created_after={yesterday}"
         if cursor:
             path += f"&cursor={cursor}"
-
         data = granola_request(path)
         if not data or "notes" not in data:
             break
-
         notes.extend(data["notes"])
-
         if data.get("hasMore") and data.get("cursor"):
             cursor = data["cursor"]
         else:
             break
-
     return notes
 
 
 def fetch_note_with_transcript(note_id):
-    """Fetch a single note with its full transcript."""
     return granola_request(f"/notes/{note_id}?include=transcript")
 
 
 # ── The Prompt ───────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a fractional Deal Desk Analyst and Sales Coach embedded with a Regional Sales Director at a B2B HCM/payroll software company (Paylocity). You review daily meeting transcripts and produce a morning intelligence briefing — not an administrative summary.
+SYSTEM_PROMPT = r"""You are a fractional Deal Desk Analyst and Sales Coach embedded with a Regional Sales Director at a B2B HCM/payroll software company (Paylocity). You review daily meeting transcripts and produce a morning intelligence briefing — not an administrative summary.
 
-Your output must be clean, inline HTML. Do NOT use Markdown syntax. Do NOT wrap output in code blocks or backticks. Use only HTML tags: <h2>, <h3>, <p>, <ul>, <li>, <strong>, <em>, <span>, <table>, <tr>, <td>, <th>.
+<output_format>
+Your output must be clean, inline-styled HTML ready to be pasted inside an email <td>.
+- Do NOT use Markdown syntax anywhere. No asterisks, hashes, backticks, or code fences.
+- Do NOT include <style> blocks. ALL styling must be inline on each tag via style="..." attributes.
+- Use only these tags: <h2>, <h3>, <p>, <ul>, <li>, <ol>, <strong>, <em>, <span>, <br>.
+- Strip all pleasantries, travel stories, small talk, and filler. Focus exclusively on pipeline movement, deal mechanics, coaching opportunities, and strategic decisions.
+</output_format>
 
-Strip out all pleasantries, travel chatter, small talk, and filler. Focus exclusively on pipeline movement, deal mechanics, coaching opportunities, and strategic decisions.
+<styling_reference>
+Apply these exact inline styles on every occurrence — email clients strip shared stylesheets.
 
-For each meeting, output this exact structure:
+Meeting title:
+  <h3 style="font-size:16px; font-weight:700; color:#c8d6e5; margin:28px 0 6px; padding:0;">
 
-<meeting>
-<h3>[Meeting Title]</h3>
-<p class="meta"><strong>Attendees:</strong> [names and roles where identifiable]</p>
+Attendee line:
+  <p style="font-size:13px; color:#888888; margin:4px 0 12px;"><strong style="color:#888888;">Attendees:</strong> ...</p>
 
-<p class="deal-status"><strong>Deal Status / Situation Read:</strong> [2-3 sentences. Read between the lines. Where does this deal ACTUALLY stand? Is the prospect buying or stalling? Did the rep create urgency or let it slip? Is there a hard next step with a date, or a soft "we'll circle back"? Be brutally honest.]</p>
+Deal Status block (the blue sidebar):
+  <p style="background-color:#1e2a3a; border-left:3px solid #4a9eff; padding:12px 16px; border-radius:0 6px 6px 0; margin:12px 0; font-size:14px; line-height:1.6; color:#b8cce0;"><strong style="color:#e0e0e0;">Deal Status:</strong> ...</p>
 
-<p><strong>Key Decisions:</strong></p>
-<ul>[Only decisions that were actually locked in. If none, omit this section entirely.]</ul>
+Section label:
+  <p style="font-size:14px; color:#cccccc; margin:14px 0 4px;"><strong style="color:#e0e0e0;">Coaching Notes:</strong></p>
 
-<p><strong>Coaching Notes:</strong></p>
-<ul>[1-2 specific, actionable observations. Did the rep miss a buying signal? Give away leverage too early? Fail to isolate an objection? Let a competitor mention slide without probing? If the call was run well, say so in one line and move on. Do NOT fabricate coaching points — only flag what genuinely happened.]</ul>
+Bullet lists:
+  <ul style="margin:4px 0 14px 0; padding-left:20px;">
+  <li style="font-size:14px; line-height:1.6; color:#cccccc; margin-bottom:5px;">
 
-<p><strong>Next Steps:</strong></p>
-<ul>[Single merged list. Every item has an <strong>owner</strong> and a <strong>deadline</strong>. If no deadline was stated, write "no date set — needs one." AE-level tasks and director-level tasks both go here but tag director items with 🔴.]</ul>
+Director priorities heading:
+  <h2 style="font-size:18px; font-weight:700; color:#e0e0e0; margin:36px 0 10px; padding:16px 0 8px; border-top:1px solid #333333;">🔴 Director Priorities — Today</h2>
 
-<p><strong>Market Intel:</strong></p>
-<ul>[Competitor mentions, pricing objections, feature requests, or industry intel worth logging. If none, omit this section.]</ul>
-</meeting>
+Pipeline Pulse heading:
+  <h2 style="font-size:18px; font-weight:700; color:#e0e0e0; margin:36px 0 10px; padding:16px 0 8px; border-top:1px solid #333333;">📊 Pipeline Pulse</h2>
 
-After all meetings, output exactly this closing section:
+Ordered list:
+  <ol style="margin:8px 0 12px 0; padding-left:20px;">
+  <li style="font-size:14px; line-height:1.6; color:#cccccc; margin-bottom:10px;">
 
-<h2>🔴 Director Priorities — Today</h2>
-<p>Maximum 3 items. These are ONLY things that require the Sales Director's personal intervention, approval, or decision today. Everything else belongs to the AEs. If fewer than 3 warrant director action, list fewer.</p>
-<ol>[Each item: what to do, why it matters, and the specific rep/deal involved.]</ol>
+Body text:
+  <p style="font-size:14px; line-height:1.65; color:#cccccc; margin:8px 0;">
 
-<h2>📊 Pipeline Pulse</h2>
-<p>[3-4 sentences. Across all of yesterday's meetings, what is the overall trajectory? Any deals accelerating? Any slipping? Any patterns across reps — e.g., multiple reps struggling with the same objection, or a competitor showing up repeatedly?]</p>"""
+Bold inside any element:
+  <strong style="color:#e0e0e0;">
 
+Director-level items in Next Steps: prefix with 🔴 emoji.
+</styling_reference>
+
+<per_meeting_structure>
+For each meeting, output this structure:
+
+1. MEETING TITLE + ATTENDEES
+
+2. DEAL STATUS (blue sidebar) — 80–100 words MAXIMUM. This is your analytical read, not a recap. Where does the deal actually stand? Is the prospect buying or stalling? Is there a hard next step or a soft "we'll circle back"? What is the single biggest risk or opportunity? Be direct, opinionated, and concise. Do NOT summarize the meeting — interpret it.
+
+3. KEY DECISIONS — Bullet list. Only if real decisions were locked in during this meeting. If none, omit this section entirely. Do not fabricate decisions.
+
+4. COACHING NOTES — 1-2 bullets maximum. Rules:
+   - Flag only UNADDRESSED blind spots or NET-NEW strategic insights the director may not have caught.
+   - Do NOT repeat anything from the Deal Status section. Assume the reader just read it.
+   - Do NOT validate coaching the director already delivered on the call.
+   - If the rep executed cleanly and no blind spots exist, write one line: "Clean execution — no coaching gaps to flag." Then move on.
+
+5. NEXT STEPS — Single merged list combining actions and follow-ups. Rules:
+   - Every item: <strong style="color:#e0e0e0;">Owner</strong> — action — deadline.
+   - If no deadline was stated, write "no date — needs one."
+   - COMBINE related items into single bullets. Three sends to the same person = one bullet.
+   - Tag director-level items with 🔴.
+   - Target 4–6 bullets per meeting. If you exceed 7, you are being too granular — consolidate.
+
+6. MARKET INTEL — Competitor mentions, pricing objections, feature requests, vulnerable competitor signals, or industry intelligence. If nothing surfaced, omit this section entirely.
+</per_meeting_structure>
+
+<closing_sections>
+After all meetings, output exactly two closing sections:
+
+🔴 DIRECTOR PRIORITIES — TODAY
+- Maximum 3 items. ONLY things requiring the Sales Director's personal intervention, approval, or decision today. AE-level execution does not belong here.
+- Each item: what to do, why it's urgent, which rep/deal. 2-3 sentences max per item.
+- If fewer than 3 warrant director action, list fewer. Do NOT pad.
+
+📊 PIPELINE PULSE
+- 3-5 sentences. Overall trajectory across all meetings. Deals accelerating or slipping? Patterns across reps — same objection, same competitor, systemic gaps? End with one cross-meeting insight the director might not have connected from individual 1:1s.
+</closing_sections>"""
+
+
+# ── Claude API ───────────────────────────────────────────────────────────────
 
 def summarize_with_claude(meetings_text):
-    """Send meeting transcripts to Claude Opus for analysis."""
     payload = json.dumps({
         "model": CLAUDE_MODEL,
         "max_tokens": 16384,
@@ -166,73 +218,30 @@ def summarize_with_claude(meetings_text):
         return None
 
 
-# ── Email Template ───────────────────────────────────────────────────────────
+# ── Email ────────────────────────────────────────────────────────────────────
 
 def wrap_html(body_content, digest_date):
-    """Wrap Claude's HTML output in a polished email template."""
+    """Wrap Claude's inline-styled HTML output in a bulletproof email shell.
+    100% inline CSS — no <style> blocks — for Outlook/Gmail compatibility."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-<body style="margin:0; padding:0; background-color:#111111; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+<body style="margin:0; padding:0; background-color:#111111; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#111111;">
 <tr><td align="center" style="padding:24px 16px;">
 <table role="presentation" width="680" cellpadding="0" cellspacing="0" style="max-width:680px; width:100%;">
 
-<!-- Header -->
 <tr><td style="background:linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border-radius:12px 12px 0 0; padding:32px 36px 24px;">
-  <h1 style="margin:0 0 4px; font-size:22px; font-weight:700; color:#e0e0e0; letter-spacing:-0.3px;">Morning Briefing</h1>
-  <p style="margin:0; font-size:14px; color:#888888;">{digest_date}</p>
+  <h1 style="margin:0 0 4px; font-size:22px; font-weight:700; color:#e0e0e0; letter-spacing:-0.3px; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">Morning Briefing</h1>
+  <p style="margin:0; font-size:14px; color:#888888; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">{digest_date}</p>
 </td></tr>
 
-<!-- Body -->
-<tr><td style="background-color:#1a1a1a; padding:28px 36px 36px; border-radius:0 0 12px 12px;">
-  <style>
-    h2 {{
-      font-size:18px; font-weight:700; color:#e0e0e0;
-      margin:36px 0 12px; padding:16px 0 8px;
-      border-top:1px solid #333333;
-    }}
-    h2:first-child {{ border-top:none; margin-top:0; padding-top:0; }}
-    h3 {{
-      font-size:16px; font-weight:700; color:#c8d6e5;
-      margin:28px 0 8px; padding:0;
-    }}
-    p {{ font-size:14px; line-height:1.65; color:#cccccc; margin:8px 0; }}
-    p.meta {{ font-size:13px; color:#888888; margin:4px 0 12px; }}
-    p.deal-status {{
-      background-color:#1e2a3a; border-left:3px solid #4a9eff;
-      padding:12px 16px; border-radius:0 6px 6px 0; margin:12px 0;
-      font-size:14px; line-height:1.6; color:#b8cce0;
-    }}
-    ul {{ margin:6px 0 12px 0; padding-left:20px; }}
-    li {{
-      font-size:14px; line-height:1.6; color:#cccccc;
-      margin-bottom:6px; padding-left:4px;
-    }}
-    ol {{ margin:8px 0 12px 0; padding-left:20px; }}
-    ol li {{
-      font-size:14px; line-height:1.6; color:#cccccc;
-      margin-bottom:10px; padding-left:4px;
-    }}
-    strong {{ color:#e0e0e0; }}
-    em {{ color:#aaaaaa; font-style:italic; }}
-    table.intel {{ width:100%; border-collapse:collapse; margin:8px 0; }}
-    table.intel th {{
-      text-align:left; font-size:12px; font-weight:600;
-      color:#888888; text-transform:uppercase; letter-spacing:0.5px;
-      padding:6px 12px; border-bottom:1px solid #333333;
-    }}
-    table.intel td {{
-      font-size:14px; color:#cccccc; padding:8px 12px;
-      border-bottom:1px solid #222222;
-    }}
-  </style>
+<tr><td style="background-color:#1a1a1a; padding:28px 36px 36px; border-radius:0 0 12px 12px; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
   {body_content}
 </td></tr>
 
-<!-- Footer -->
 <tr><td style="padding:20px 36px 8px; text-align:center;">
-  <p style="margin:0; font-size:12px; color:#555555;">
+  <p style="margin:0; font-size:12px; color:#555555; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
     Generated by Claude Opus &middot; Granola &rarr; Anthropic API &middot; GitHub Actions
   </p>
 </td></tr>
@@ -245,8 +254,6 @@ def wrap_html(body_content, digest_date):
 
 
 def strip_plaintext(html):
-    """Rough plaintext fallback: strip tags for non-HTML email clients."""
-    import re
     text = re.sub(r'<br\s*/?>', '\n', html)
     text = re.sub(r'</(p|li|h[1-6]|tr|div)>', '\n', text)
     text = re.sub(r'<[^>]+>', '', text)
@@ -255,15 +262,12 @@ def strip_plaintext(html):
 
 
 def send_email(subject, html_body):
-    """Send the digest via SMTP."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = EMAIL_TO
 
-    # Plaintext fallback
     msg.attach(MIMEText(strip_plaintext(html_body), "plain"))
-    # HTML version (primary)
     msg.attach(MIMEText(html_body, "html"))
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
@@ -279,7 +283,6 @@ def send_email(subject, html_body):
 def main():
     check_config()
 
-    # Step 1: Fetch yesterday's notes
     print("Fetching yesterday's meeting notes from Granola...")
     notes = fetch_yesterday_notes()
 
@@ -289,7 +292,6 @@ def main():
 
     print(f"Found {len(notes)} meeting(s). Fetching transcripts...")
 
-    # Step 2: Fetch transcripts
     meetings_text_parts = []
     for note in notes:
         note_id = note.get("id", "unknown")
@@ -317,9 +319,8 @@ def main():
         section += f"TRANSCRIPT:\n{transcript_text}\n"
         meetings_text_parts.append(section)
 
-    meetings_text = "\n" + ("=" * 60) + "\n\n".join(meetings_text_parts)
+    meetings_text = ("\n" + "=" * 60 + "\n\n").join(meetings_text_parts)
 
-    # Step 3: Analyze with Claude Opus
     print("Generating briefing with Claude Opus...")
     digest_html = summarize_with_claude(meetings_text)
 
@@ -327,7 +328,6 @@ def main():
         print("ERROR: Failed to generate briefing.")
         sys.exit(1)
 
-    # Step 4: Wrap in email template and send
     now_ct = datetime.now(CT)
     digest_date = now_ct.strftime("%A, %B %-d, %Y")
     subject = f"Morning Briefing — {digest_date}"
