@@ -26,7 +26,7 @@ SMTP_PASS = os.environ.get("SMTP_PASS")  # app password (not your regular passwo
 
 GRANOLA_BASE = "https://public-api.granola.ai/v1"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 
 def check_config():
