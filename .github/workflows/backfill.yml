@@ -1,0 +1,35 @@
+name: Backfill Digest Archive
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # Higher limit — processing 14 days of transcripts
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run backfill
+        env:
+          GRANOLA_API_KEY: ${{ secrets.GRANOLA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python backfill.py
+
+      - name: Commit digest files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add digests/
+          git diff --staged --quiet || git commit -m "Backfill digest archive ($(ls digests/*.json | wc -l) days)"
+          git push
