@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Granola Daily Meeting Digest v3
+Granola Daily Meeting Digest v3.1
 Pulls yesterday's meeting notes from Granola, runs them through Claude Opus
-as a deal desk analyst / sales coach, and emails a formatted HTML digest.
+as a deal desk analyst / sales coach, emails a formatted HTML digest, and
+saves the analysis to digests/ for the afternoon prep script.
 
 Changelog:
-  v3 — Inline CSS for enterprise email compatibility, tightened prompt
-        (100-word deal status cap, consolidated next steps, no-repeat coaching),
-        16384 max_tokens, CT timezone fix.
-  v2 — Opus upgrade, HTML output, coaching prompt, dark email template.
-  v1 — Initial build. Sonnet, markdown output.
+  v3.1 — Saves digest output to digests/YYYY-MM-DD.json for daily prep pipeline.
+  v3   — Inline CSS, tightened prompt, 16384 max_tokens, CT timezone fix.
+  v2   — Opus upgrade, HTML output, coaching prompt, dark email template.
+  v1   — Initial build. Sonnet, markdown output.
 """
 
 import os
@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 
 # ── Configuration ────────────────────────────────────────────────────────────
 GRANOLA_API_KEY = os.environ.get("GRANOLA_API_KEY")
@@ -37,6 +38,8 @@ GRANOLA_BASE = "https://public-api.granola.ai/v1"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-opus-4-6"
 CT = ZoneInfo("America/Chicago")
+
+DIGEST_DIR = Path(__file__).parent / "digests"
 
 
 def check_config():
@@ -221,8 +224,6 @@ def summarize_with_claude(meetings_text):
 # ── Email ────────────────────────────────────────────────────────────────────
 
 def wrap_html(body_content, digest_date):
-    """Wrap Claude's inline-styled HTML output in a bulletproof email shell.
-    100% inline CSS — no <style> blocks — for Outlook/Gmail compatibility."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
@@ -278,6 +279,25 @@ def send_email(subject, html_body):
     print(f"Digest emailed to {EMAIL_TO}")
 
 
+# ── Digest Storage ───────────────────────────────────────────────────────────
+
+def save_digest(digest_date_str, meeting_titles, digest_html):
+    DIGEST_DIR.mkdir(exist_ok=True)
+
+    digest_data = {
+        "date": digest_date_str,
+        "meeting_count": len(meeting_titles),
+        "meetings": meeting_titles,
+        "analysis_html": digest_html,
+    }
+
+    filepath = DIGEST_DIR / f"{digest_date_str}.json"
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(digest_data, f, ensure_ascii=False, indent=2)
+
+    print(f"Digest saved to {filepath}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -292,10 +312,12 @@ def main():
 
     print(f"Found {len(notes)} meeting(s). Fetching transcripts...")
 
+    meeting_titles = []
     meetings_text_parts = []
     for note in notes:
         note_id = note.get("id", "unknown")
         title = note.get("title", "Untitled Meeting")
+        meeting_titles.append(title)
         print(f"  → {title}")
 
         full_note = fetch_note_with_transcript(note_id)
@@ -331,11 +353,15 @@ def main():
     now_ct = datetime.now(CT)
     digest_date = now_ct.strftime("%A, %B %-d, %Y")
     subject = f"Morning Briefing — {digest_date}"
-
     full_html = wrap_html(digest_html, digest_date)
 
     print("Sending email...")
     send_email(subject, full_html)
+
+    # Save for prep pipeline
+    yesterday_ct = now_ct - timedelta(days=1)
+    save_digest(yesterday_ct.strftime("%Y-%m-%d"), meeting_titles, digest_html)
+
     print("Done!")
 
 
